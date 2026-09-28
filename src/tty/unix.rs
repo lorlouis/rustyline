@@ -2181,7 +2181,18 @@ mod kitty {
 
     fn key_event(kcode: u32, mods: M) -> KeyEvent {
         let k = match kcode {
-            9 => K::Tab,
+            // Ctrl+H is a backspace alias; `KeyEvent::new(0x08)` yields
+            // `Backspace` with no CTRL, and the keymap binds that form
+            8 => return KeyEvent(K::Backspace, M::NONE),
+            // Shift+Tab is `BackTab`, matching `KeyEvent::new(0x09)`
+            9 => {
+                if mods.contains(M::SHIFT) {
+                    let mut m = mods;
+                    m.remove(M::SHIFT);
+                    return KeyEvent(K::BackTab, m);
+                }
+                K::Tab
+            }
             13 => K::Enter,
             27 => K::Esc,
             127 => K::Backspace,
@@ -2212,7 +2223,18 @@ mod kitty {
                 return KeyEvent(K::UnknownEscSeq, M::NONE);
             }
             // any other valid code point
-            32..=0x10_FFFF => K::Char(char::from_u32(kcode).expect("valid code point")),
+            32..=0x10_FFFF => {
+                let c = char::from_u32(kcode).expect("valid code point");
+                // Ctrl+letter is reported as the *uppercase* letter + CTRL
+                // (matching `KeyEvent::new` for the raw control byte, and the
+                // keymap's `Char(., CTRL)` bindings); kitty sends the base
+                // letter codepoint with the CTRL modifier, so uppercase it.
+                if mods.contains(M::CTRL) && c.is_ascii_lowercase() {
+                    K::Char(c.to_ascii_uppercase())
+                } else {
+                    K::Char(c)
+                }
+            }
             _ => return KeyEvent(K::UnknownEscSeq, M::NONE),
         };
         KeyEvent(k, mods)
@@ -2259,8 +2281,42 @@ mod kitty {
         }
 
         #[test]
-        fn decode_control_keys() {
-            // control keys: control code + CTRL modifier
+        fn decode_tab_and_shift_tab() {
+            assert_eq!(decode(b"[9u"), Some(KeyEvent(K::Tab, M::NONE)));
+            assert_eq!(
+                decode(b"[9;2u"),
+                Some(KeyEvent(K::BackTab, M::NONE))
+            );
+        }
+
+        #[test]
+        fn decode_ctrl_letter() {
+            // terminals send Ctrl+letter as the *letter* codepoint + CTRL
+            // modifier; it is decoded as the uppercase letter + CTRL so it
+            // matches the keymap's `Char(., CTRL)` bindings
+            assert_eq!(
+                decode(b"[100;5u"),
+                Some(KeyEvent(K::Char('D'), M::CTRL))
+            );
+            assert_eq!(
+                decode(b"[122;5u"),
+                Some(KeyEvent(K::Char('Z'), M::CTRL))
+            );
+            assert_eq!(
+                decode(b"[99;5u"),
+                Some(KeyEvent(K::Char('C'), M::CTRL))
+            );
+            // a non-letter is left as-is
+            assert_eq!(
+                decode(b"[32;5u"),
+                Some(KeyEvent(K::Char(' '), M::CTRL))
+            );
+        }
+
+        #[test]
+        fn decode_control_code_keys() {
+            // some encoders send the control code itself (0..=31); decode it
+            // the same way as the letter form
             assert_eq!(
                 decode(b"[4;5u"),
                 Some(KeyEvent(K::Char('D'), M::CTRL))
@@ -2278,6 +2334,12 @@ mod kitty {
             assert_eq!(
                 decode(b"[4;1u"),
                 Some(KeyEvent(K::Char('D'), M::CTRL))
+            );
+            // Ctrl+H is a backspace alias (no CTRL, matching legacy)
+            assert_eq!(decode(b"[8u"), Some(KeyEvent(K::Backspace, M::NONE)));
+            assert_eq!(
+                decode(b"[8;5u"),
+                Some(KeyEvent(K::Backspace, M::NONE))
             );
             // code 0 maps to '@', as `KeyEvent::new('\x00')` does
             assert_eq!(
@@ -2370,8 +2432,9 @@ mod test_kitty {
 
     #[test]
     fn kitty_ctrl_char() {
-        // ctrl+a is CSI 97;5 u (1 + 4 = 5)
-        read_kitty(b"\x1b[97;5u", &[KeyEvent(K::Char('a'), M::CTRL)]);
+        // ctrl+a is CSI 97;5 u (1 + 4 = 5); decoded as the uppercase
+        // letter + CTRL to match the keymap's `Char(., CTRL)` bindings
+        read_kitty(b"\x1b[97;5u", &[KeyEvent(K::Char('A'), M::CTRL)]);
     }
 
     #[test]
