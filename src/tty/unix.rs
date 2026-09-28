@@ -2196,10 +2196,17 @@ mod kitty {
             HOME => K::Home,
             END => K::End,
             57364..=57393 => K::F((kcode - 57364 + 1) as u8),
-            // control keys, surrogates, and the rest of the Private Use Area
+            // control keys are encoded as their control code (0..=31) with
+            // the CTRL modifier; render them as the matching uppercase
+            // letter + CTRL, matching `KeyEvent::new` for raw control bytes
+            // (so Ctrl-D/Z/C reach the keymap's `Char(., CTRL)` bindings)
+            0..=31 => {
+                let c = char::from_u32(kcode + 0x40).expect("valid control letter");
+                return KeyEvent(K::Char(c), mods | M::CTRL);
+            }
+            // surrogates, and the rest of the Private Use Area
             // (lock keys, keypad, ...): not representable as a single key event
-            _ if kcode < 32
-                || (0xD800..=0xDFFF).contains(&kcode)
+            _ if (0xD800..=0xDFFF).contains(&kcode)
                 || (57344..=63743).contains(&kcode) =>
             {
                 return KeyEvent(K::UnknownEscSeq, M::NONE);
@@ -2249,6 +2256,34 @@ mod kitty {
             assert_eq!(decode(b"[97;9u"), Some(KeyEvent(K::Char('a'), M::NONE)));
             // caps_lock (1 + 64 = 65) has no corresponding modifier, is ignored
             assert_eq!(decode(b"[97;65u"), Some(KeyEvent(K::Char('a'), M::NONE)));
+        }
+
+        #[test]
+        fn decode_control_keys() {
+            // control keys: control code + CTRL modifier
+            assert_eq!(
+                decode(b"[4;5u"),
+                Some(KeyEvent(K::Char('D'), M::CTRL))
+            );
+            assert_eq!(
+                decode(b"[26;5u"),
+                Some(KeyEvent(K::Char('Z'), M::CTRL))
+            );
+            assert_eq!(
+                decode(b"[3;5u"),
+                Some(KeyEvent(K::Char('C'), M::CTRL))
+            );
+            // CTRL is implied by the control code even when the modifier
+            // field reports none
+            assert_eq!(
+                decode(b"[4;1u"),
+                Some(KeyEvent(K::Char('D'), M::CTRL))
+            );
+            // code 0 maps to '@', as `KeyEvent::new('\x00')` does
+            assert_eq!(
+                decode(b"[0;5u"),
+                Some(KeyEvent(K::Char('@'), M::CTRL))
+            );
         }
 
         #[test]
