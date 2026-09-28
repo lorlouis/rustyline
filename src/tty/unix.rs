@@ -158,6 +158,8 @@ impl RawMode for PosixMode {
         #[cfg(feature = "kitty-keyboard-protocol")]
         if let Some(out) = self.kitty_out {
             write_all(out, KITTY_DISABLE)?;
+            #[cfg(not(feature = "signal-hook"))]
+            clear_kitty_sigstop_handler();
         }
         self.raw_mode.store(false, Ordering::SeqCst);
         Ok(())
@@ -1436,6 +1438,66 @@ extern "C" fn sig_handler(sig: libc::c_int) {
     }
 }
 
+/// Output fd to turn the kitty keyboard protocol off in a signal handler.
+/// `ISIG` stays on in raw mode, so the kernel stops the process on Ctrl+Z
+/// before the editor can read the key (and disable the protocol); the shell
+/// restores termios on `fg` but not the kitty capability, which would
+/// otherwise leak into the next foreground program. Set while the protocol
+/// is active, cleared when it is not.
+#[cfg(all(not(feature = "signal-hook"), feature = "kitty-keyboard-protocol"))]
+static KITTY_SIGTSTP_OUT: AtomicI32 = AtomicI32::new(-1);
+/// Turn the kitty protocol off, reset to the default (stop) disposition, and
+/// re-raise so the process is still stopped by the original SIGTSTP.
+#[cfg(all(not(feature = "signal-hook"), feature = "kitty-keyboard-protocol"))]
+extern "C" fn kitty_sigstop_handler(_sig: libc::c_int) {
+    use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, Signal};
+    use nix::unistd::Pid;
+    let fd = KITTY_SIGTSTP_OUT.load(Ordering::Relaxed);
+    if fd != -1 {
+        let _ = write(AltFd(fd), KITTY_DISABLE.as_bytes());
+    }
+    // Reset to the default action so the re-raise below stops the process
+    // (`SA_NODEFER` keeps the signal unblocked during the reset).
+    let sa = SigAction::new(
+        SigHandler::SigDfl,
+        SaFlags::SA_NODEFER,
+        nix::sys::signal::SigSet::empty(),
+    );
+    unsafe {
+        let _ = sigaction(Signal::SIGTSTP, &sa);
+    }
+    let _ = kill(Pid::from_raw(0), Signal::SIGTSTP);
+}
+/// Install the SIGTSTP handler so a stop disables the kitty protocol before
+/// the process is suspended. Called on every `enable_raw_mode`; the matching
+/// `disable_raw_mode` resets the disposition, so there is no state that
+/// outlives a raw session.
+#[cfg(all(not(feature = "signal-hook"), feature = "kitty-keyboard-protocol"))]
+fn install_kitty_sigstop_handler(out: AltFd) {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
+    KITTY_SIGTSTP_OUT.store(out.0, Ordering::Relaxed);
+    let sa = SigAction::new(
+        SigHandler::Handler(kitty_sigstop_handler),
+        SaFlags::empty(),
+        nix::sys::signal::SigSet::empty(),
+    );
+    unsafe {
+        let _ = sigaction(Signal::SIGTSTP, &sa);
+    }
+}
+/// Reset SIGTSTP to its default (stop) action and drop the fd, so a stop
+/// no longer tries to disable the protocol. Pairs with
+/// `install_kitty_sigstop_handler` on every `disable_raw_mode`.
+#[cfg(all(not(feature = "signal-hook"), feature = "kitty-keyboard-protocol"))]
+fn clear_kitty_sigstop_handler() {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
+    KITTY_SIGTSTP_OUT.store(-1, Ordering::Relaxed);
+    let sa = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), nix::sys::signal::SigSet::empty());
+    unsafe {
+        let _ = sigaction(Signal::SIGTSTP, &sa);
+    }
+}
+
 #[derive(Debug)]
 struct Sig {
     pipe: UnixStream,
@@ -1806,6 +1868,13 @@ impl Term for PosixTerminal {
         } else {
             None
         };
+        // arm the one-shot SIGTSTP handler for the duration of this raw
+        // session, so a stop disables the protocol before the process is
+        // suspended (the shell restores termios on `fg`, not the protocol).
+        #[cfg(all(not(feature = "signal-hook"), feature = "kitty-keyboard-protocol"))]
+        if let Some(out) = kitty_out {
+            install_kitty_sigstop_handler(out);
+        }
 
         Ok((
             PosixMode {
