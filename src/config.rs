@@ -46,6 +46,8 @@ pub struct Config {
     enable_synchronized_output: bool,
     /// Whether to disable or not the signals in termios
     enable_signals: bool,
+    /// Kitty keyboard protocol on unix platform
+    kitty_keyboard: bool,
 }
 
 impl Config {
@@ -244,6 +246,21 @@ impl Config {
     pub(crate) fn set_enable_signals(&mut self, enable_signals: bool) {
         self.enable_signals = enable_signals;
     }
+
+    /// Kitty keyboard protocol on unix platform
+    ///
+    /// Requires the `kitty-keyboard-protocol` feature. It's only effective
+    /// if the terminal is probed and found to support the protocol.
+    ///
+    /// By default, it's disabled.
+    #[must_use]
+    pub fn kitty_keyboard(&self) -> bool {
+        self.kitty_keyboard
+    }
+
+    pub(crate) fn set_kitty_keyboard(&mut self, kitty_keyboard: bool) {
+        self.kitty_keyboard = kitty_keyboard;
+    }
 }
 
 impl Default for Config {
@@ -268,6 +285,7 @@ impl Default for Config {
             enable_bracketed_paste: true,
             enable_synchronized_output: true,
             enable_signals: false,
+            kitty_keyboard: false,
         }
     }
 }
@@ -534,6 +552,18 @@ impl Builder {
         self
     }
 
+    /// Enable or disable the kitty keyboard protocol on unix platform
+    ///
+    /// Requires the `kitty-keyboard-protocol` feature. It's only effective
+    /// if the terminal is probed and found to support the protocol.
+    ///
+    /// By default, it's disabled.
+    #[must_use]
+    pub fn kitty_keyboard(mut self, kitty_keyboard: bool) -> Self {
+        self.set_kitty_keyboard(kitty_keyboard);
+        self
+    }
+
     /// Builds a [`Config`] with the settings specified so far.
     #[must_use]
     pub fn build(self) -> Config {
@@ -676,6 +706,13 @@ pub trait Configurer {
     /// By default, it's disabled.
     fn set_enable_signals(&mut self, enable_signals: bool) {
         self.config_mut().set_enable_signals(enable_signals);
+    }
+
+    /// Enable or disable the kitty keyboard protocol on unix platform
+    ///
+    /// By default, it's disabled.
+    fn set_kitty_keyboard(&mut self, kitty_keyboard: bool) {
+        self.config_mut().set_kitty_keyboard(kitty_keyboard);
     }
 }
 

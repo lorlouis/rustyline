@@ -74,6 +74,8 @@ rand = "0.10"
 default = ["custom-bindings", "with-dirs", "with-file-history"]
 custom-bindings = ["radix_trie"]
 derive = ["rustyline-derive"]
+# Kitty keyboard protocol on unix platform
+kitty-keyboard-protocol = []
 with-dirs = ["home"]
 with-file-history = []
 with-sqlite-history = ["rusqlite"]

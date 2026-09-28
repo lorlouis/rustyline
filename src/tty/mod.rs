@@ -199,7 +199,7 @@ pub trait Term {
     fn enable_raw_mode(&mut self, config: &Config) -> Result<(Self::Mode, Self::KeyMap)>;
     /// Create a RAW reader
     fn create_reader(
-        &self,
+        &mut self,
         buffer: Option<Self::Buffer>,
         config: &Config,
         key_map: Self::KeyMap,

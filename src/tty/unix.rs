@@ -1,6 +1,8 @@
 //! Unix specific definitions
 use std::cmp;
 use std::collections::HashMap;
+#[cfg(feature = "kitty-keyboard-protocol")]
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 #[cfg(not(feature = "buffer-redux"))]
 use std::io::BufReader;
@@ -39,6 +41,33 @@ const BRACKETED_PASTE_ON: &str = "\x1b[?2004h";
 const BRACKETED_PASTE_OFF: &str = "\x1b[?2004l";
 const BEGIN_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026h";
 const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
+#[cfg(feature = "kitty-keyboard-protocol")]
+const KITTY_ENABLE: &str = "\x1b[>1u";
+#[cfg(feature = "kitty-keyboard-protocol")]
+const KITTY_DISABLE: &str = "\x1b[u";
+#[cfg(feature = "kitty-keyboard-protocol")]
+const KITTY_PROBE: &str = "\x1b[?u\x1b[c";
+#[cfg(feature = "kitty-keyboard-protocol")]
+const KITTY_PROBE_TIMEOUT_MS: u16 = 100;
+
+/// State of the kitty keyboard protocol on a unix terminal.
+///
+/// `Confirmed` means the terminal supports the protocol and it is enabled in
+/// the current raw session. `Unsupported` is the cached result of a probe
+/// that found the terminal does not support it (so we don't probe again).
+/// `Off` is the default (not enabled, and not probed or probe pending).
+#[cfg(feature = "kitty-keyboard-protocol")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum KittyDetection {
+    /// Not enabled (not requested, not yet probed, or probe pending).
+    #[default]
+    Off,
+    /// Probed: the terminal does not support the protocol.
+    Unsupported,
+    /// Probed: the terminal supports the protocol and it is enabled in the
+    /// current raw session.
+    Confirmed,
+}
 
 nix::ioctl_read_bad!(win_size, libc::TIOCGWINSZ, libc::winsize);
 
@@ -107,6 +136,11 @@ pub struct PosixMode {
     tty_in: AltFd,
     tty_out: Option<AltFd>,
     raw_mode: Arc<AtomicBool>,
+    /// Output fd to restore the kitty keyboard protocol on, independent of
+    /// the bracketed-paste `tty_out` (which is `None` when bracketed paste is
+    /// disabled). `Some` only when the protocol is active (`Confirmed`).
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    kitty_out: Option<AltFd>,
 }
 
 #[cfg(not(test))]
@@ -119,6 +153,11 @@ impl RawMode for PosixMode {
         // disable bracketed paste
         if let Some(out) = self.tty_out {
             write_all(out, BRACKETED_PASTE_OFF)?;
+        }
+        // restore the kitty keyboard protocol mode
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        if let Some(out) = self.kitty_out {
+            write_all(out, KITTY_DISABLE)?;
         }
         self.raw_mode.store(false, Ordering::SeqCst);
         Ok(())
@@ -200,6 +239,13 @@ type PipeWriter = (Arc<Mutex<File>>, SyncSender<String>);
 pub struct PosixRawReader {
     tty_in: BufReader<TtyIn>,
     timeout_ms: PollTimeout,
+    /// Kitty keyboard protocol is active on this terminal
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    kitty: bool,
+    /// Bytes to be returned before reading from the input
+    /// (only used when the kitty keyboard protocol is enabled)
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    pushback: VecDeque<u8>,
     parser: Parser,
     key_map: PosixKeyMap,
     // external print reader
@@ -246,6 +292,11 @@ const RXVT_CTRL: char = '\x1e';
 const RXVT_CTRL_SHIFT: char = '@';
 
 impl PosixRawReader {
+    // the kitty feature adds 2 arguments, taking this over the 7-arg limit
+    #[cfg_attr(
+        feature = "kitty-keyboard-protocol",
+        expect(clippy::too_many_arguments)
+    )]
     fn new(
         fd: AltFd,
         sig: Option<Sig>,
@@ -253,6 +304,8 @@ impl PosixRawReader {
         config: &Config,
         key_map: PosixKeyMap,
         pipe_reader: Option<PipeReader>,
+        #[cfg(feature = "kitty-keyboard-protocol")] kitty: bool,
+        #[cfg(feature = "kitty-keyboard-protocol")] pending: Vec<u8>,
         #[cfg(target_os = "macos")] is_dev_tty: bool,
     ) -> Self {
         let inner = TtyIn { fd, sig };
@@ -267,6 +320,10 @@ impl PosixRawReader {
         Self {
             tty_in,
             timeout_ms: config.keyseq_timeout().into(),
+            #[cfg(feature = "kitty-keyboard-protocol")]
+            kitty,
+            #[cfg(feature = "kitty-keyboard-protocol")]
+            pushback: VecDeque::from(pending),
             parser: Parser::new(),
             key_map,
             pipe_reader,
@@ -331,9 +388,18 @@ impl PosixRawReader {
         }
     }
 
-    /// Handle \E[ <seq2> escape sequences
+    /// Handle \E[ escape sequences
     fn escape_csi(&mut self) -> Result<KeyEvent> {
         let seq2 = self.next_char()?;
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        if self.kitty {
+            return self.escape_csi_kitty(seq2);
+        }
+        self.escape_csi_legacy(seq2)
+    }
+
+    /// Handle \E[ <seq2> escape sequences (legacy encoding)
+    fn escape_csi_legacy(&mut self, seq2: char) -> Result<KeyEvent> {
         if seq2.is_ascii_digit() {
             match seq2 {
                 '0' | '9' => {
@@ -386,6 +452,62 @@ impl PosixRawReader {
                 }
             })
         }
+    }
+
+    /// Kitty keyboard protocol: buffer the whole CSI sequence.
+    /// If it is a `CSI u` key event, decode it, otherwise push the bytes
+    /// back and fall back to the legacy parser.
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    fn escape_csi_kitty(&mut self, seq2: char) -> Result<KeyEvent> {
+        // a valid CSI sequence is ascii, so a non-ascii `seq2` is not a CSI
+        // at all: parse it with the legacy parser
+        if !seq2.is_ascii() {
+            return self.escape_csi_legacy(seq2);
+        }
+        let mut csi = vec![b'[', seq2 as u8];
+        // a non-ascii char read after `[` (not part of a valid CSI), to be
+        // pushed back so it is not lost
+        let mut trailing: Option<char> = None;
+        loop {
+            match self.next_char() {
+                Ok(c) => {
+                    // CSI sequences are ASCII,
+                    // anything else means this is not a valid CSI sequence
+                    if !c.is_ascii() {
+                        trailing = Some(c);
+                        break;
+                    }
+                    csi.push(c as u8);
+                    // final byte of a CSI sequence
+                    if matches!(c as u8, 0x40..=0x7e) {
+                        break;
+                    }
+                }
+                // input ended in the middle of the sequence
+                Err(ReadlineError::Eof) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        if csi.last() == Some(&b'u') {
+            if let Some(key) = kitty::decode(&csi) {
+                return Ok(key);
+            }
+            debug!(
+                target: "rustyline",
+                "unsupported kitty key: {}",
+                String::from_utf8_lossy(&csi)
+            );
+            return Ok(E(K::UnknownEscSeq, M::NONE));
+        }
+        // not a `CSI u` key event, parse it as a legacy sequence
+        // csi[0] is '[', csi[1] is seq2 (passed directly below),
+        // so push back the remainder (csi[2..]) for the legacy parser
+        self.pushback.extend(csi[2..].iter().copied());
+        if let Some(c) = trailing {
+            let mut buf = [0u8; 4];
+            self.pushback.extend(c.encode_utf8(&mut buf).bytes());
+        }
+        self.escape_csi_legacy(seq2)
     }
 
     /// Handle \E[ <seq2:digit> escape sequences
@@ -716,6 +838,9 @@ impl PosixRawReader {
     }
 
     fn poll(&mut self, timeout: PollTimeout) -> Result<bool> {
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        let n = self.tty_in.buffer().len() + self.pushback.len();
+        #[cfg(not(feature = "kitty-keyboard-protocol"))]
         let n = self.tty_in.buffer().len();
         if n > 0 {
             return Ok(true);
@@ -816,7 +941,11 @@ impl RawReader for PosixRawReader {
     type Buffer = PosixBuffer;
 
     fn wait_for_input(&mut self, single_esc_abort: bool) -> Result<Event> {
-        if !self.tty_in.buffer().is_empty() {
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        let has_input = !self.tty_in.buffer().is_empty() || !self.pushback.is_empty();
+        #[cfg(not(feature = "kitty-keyboard-protocol"))]
+        let has_input = !self.tty_in.buffer().is_empty();
+        if has_input {
             return self.next_key(single_esc_abort).map(Event::KeyPress);
         }
         cfg_select! {
@@ -864,11 +993,28 @@ impl RawReader for PosixRawReader {
             valid: true,
         };
         loop {
-            let n = self.tty_in.read(&mut buf)?;
-            if n == 0 {
-                return Err(ReadlineError::Eof);
-            }
-            let b = buf[0];
+            let b = {
+                #[cfg(feature = "kitty-keyboard-protocol")]
+                {
+                    if let Some(first) = self.pushback.pop_front() {
+                        first
+                    } else {
+                        let n = self.tty_in.read(&mut buf)?;
+                        if n == 0 {
+                            return Err(ReadlineError::Eof);
+                        }
+                        buf[0]
+                    }
+                }
+                #[cfg(not(feature = "kitty-keyboard-protocol"))]
+                {
+                    let n = self.tty_in.read(&mut buf)?;
+                    if n == 0 {
+                        return Err(ReadlineError::Eof);
+                    }
+                    buf[0]
+                }
+            };
             self.parser.advance(&mut receiver, b);
             if !receiver.valid {
                 return Err(ReadlineError::from(ErrorKind::InvalidData));
@@ -1374,6 +1520,15 @@ pub struct PosixTerminal {
     pipe_reader: Option<PipeReader>,
     // external print writer
     pipe_writer: Option<PipeWriter>,
+    /// Kitty keyboard protocol detection state
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    kitty: KittyDetection,
+    /// Leftover bytes read while probing for kitty support (a trailing
+    /// progressive-enhancement response, or a user keystroke that arrived
+    /// during the probe). Consumed by the next reader's pushback so it is
+    /// not lost.
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    pending_probe: Vec<u8>,
 }
 
 impl PosixTerminal {
@@ -1383,6 +1538,157 @@ impl PosixTerminal {
             ColorMode::Forced => true,
             ColorMode::Disabled => false,
         }
+    }
+
+    /// Check if the terminal supports the kitty keyboard protocol.
+    ///
+    /// As described in the protocol documentation, the terminal is asked for
+    /// the current progressive enhancement status and for its primary device
+    /// attributes: if the device attributes are answered without an answer
+    /// for the progressive enhancement, the terminal does not support the
+    /// protocol.
+    ///
+    /// Must be called while raw mode is enabled.
+    /// Returns true if the terminal supports the protocol. A negative probe
+    /// result is cached so the probe is not repeated on every read.
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    fn check_kitty_support(&mut self) -> bool {
+        match self.kitty {
+            KittyDetection::Unsupported => false,
+            KittyDetection::Confirmed => true,
+            // not probed yet: try to probe
+            KittyDetection::Off => {
+                // do not probe if there is input pending (it would be
+                // consumed while reading the response), probe again next time
+                match poll::poll(
+                    &mut [poll::PollFd::new(self.tty_in.as_fd(), PollFlags::POLLIN)],
+                    PollTimeout::ZERO,
+                ) {
+                    Ok(0) => self.probe_kitty_support(),
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Probe the terminal once to determine whether it supports the kitty
+    /// keyboard protocol.
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    fn probe_kitty_support(&mut self) -> bool {
+        let supported = if let Err(e) = write_all(self.tty_out, KITTY_PROBE) {
+            debug!(target: "rustyline", "Cannot probe kitty keyboard protocol: {e}");
+            false
+        } else {
+            match self.read_kitty_response() {
+                Ok(supported) => supported,
+                Err(e) => {
+                    debug!(target: "rustyline", "kitty probe failed: {e}");
+                    false
+                }
+            }
+        };
+        if !supported {
+            self.kitty = KittyDetection::Unsupported;
+        }
+        supported
+    }
+
+    /// Read the terminal's response to the kitty probe.
+    ///
+    /// The probe asks for the primary device attributes (`\E[c`); a terminal
+    /// that supports the protocol also answers for the progressive
+    /// enhancement status (`\E[?u`). We scan the response byte by byte and
+    /// stop as soon as the device-attributes response (`\E[?…c`) is complete,
+    /// so the window during which user keystrokes could be read (and
+    /// discarded) is kept to a single burst of reads. Any bytes read after
+    /// the DA response — a trailing progressive-enhancement response, or a
+    /// user keystroke that arrived in the same burst — are stored in
+    /// `pending_probe` to be handed to the next reader, so they are not lost.
+    ///
+    /// Returns true if the terminal supports the protocol.
+    #[cfg(feature = "kitty-keyboard-protocol")]
+    fn read_kitty_response(&mut self) -> Result<bool> {
+        // state of the in-progress response scan
+        const S0: u8 = 0; // expecting ESC
+        const S1: u8 = 1; // ESC, expecting '['
+        const S2: u8 = 2; // ESC [ , expecting '?'
+        const S3: u8 = 3; // ESC [ ? , reading params, expecting final byte
+        const S4: u8 = 4; // DA response complete
+        const ROUNDS: usize = 5; // 5 x 100 ms: give up if no response
+        let mut state = S0;
+        let mut found_pe = false;
+        let mut leftover = Vec::new();
+        let mut buffer = [0u8; 64];
+        for _ in 0..ROUNDS {
+            let mut fds = [poll::PollFd::new(self.tty_in.as_fd(), PollFlags::POLLIN)];
+            match poll::poll(&mut fds, PollTimeout::from(KITTY_PROBE_TIMEOUT_MS)) {
+                Ok(0) => break, // no (more) response
+                Ok(_) => {
+                    // read is EINTR-safe: retry on EINTR
+                    let n = loop {
+                        match read(self.tty_in, &mut buffer) {
+                            Ok(n) => break n,
+                            Err(Errno::EINTR) => continue,
+                            Err(e) => return Err(e.into()),
+                        }
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    for &b in &buffer[..n] {
+                        if state == S4 {
+                            // DA response already complete; this byte is
+                            // not part of the probe response
+                            leftover.push(b);
+                            continue;
+                        }
+                        match state {
+                            S0 => {
+                                if b == 0x1b {
+                                    state = S1;
+                                }
+                            }
+                            S1 => {
+                                if b == b'[' {
+                                    state = S2;
+                                } else {
+                                    state = S0;
+                                }
+                            }
+                            S2 => {
+                                if b == b'?' {
+                                    state = S3;
+                                } else {
+                                    state = S0;
+                                }
+                            }
+                            S3 => {
+                                if b == b'u' {
+                                    found_pe = true;
+                                    state = S0;
+                                } else if b == b'c' {
+                                    state = S4;
+                                } else if b.is_ascii_digit() || b == b';' {
+                                    // stay in S3
+                                } else {
+                                    state = S0;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if state == S4 {
+                        break; // got the DA response
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // any leftover bytes (trailing PE response or a keystroke) are not
+        // part of the probe response; hand them to the next reader
+        self.pending_probe = leftover;
+        Ok(found_pe)
     }
 }
 
@@ -1422,6 +1728,10 @@ impl Term for PosixTerminal {
             raw_mode: Arc::new(AtomicBool::new(false)),
             pipe_reader: None,
             pipe_writer: None,
+            #[cfg(feature = "kitty-keyboard-protocol")]
+            kitty: KittyDetection::Off,
+            #[cfg(feature = "kitty-keyboard-protocol")]
+            pending_probe: Vec::new(),
         })
     }
 
@@ -1467,12 +1777,44 @@ impl Term for PosixTerminal {
             self.pipe_reader = None;
         }
 
+        // enable the kitty keyboard protocol
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        {
+            // the protocol is active for this session if it was requested and
+            // the terminal supports it and the enable write succeeded
+            let enabled = c.kitty_keyboard()
+                && self.check_kitty_support()
+                && write_all(self.tty_out, KITTY_ENABLE).is_ok();
+            self.kitty = if enabled {
+                KittyDetection::Confirmed
+            } else if let KittyDetection::Confirmed = self.kitty {
+                // was enabled on the previous session
+                KittyDetection::Off
+            } else {
+                // keep `Off` (not probed / probe deferred) or `Unsupported`
+                // (cached probe result)
+                self.kitty
+            };
+        }
+        // output fd to restore the kitty keyboard protocol on. It is
+        // independent of the bracketed-paste `out` (which is `None` when
+        // bracketed paste is disabled); it is `Some` only when the protocol
+        // was actually enabled this session.
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        let kitty_out = if matches!(self.kitty, KittyDetection::Confirmed) {
+            Some(self.tty_out)
+        } else {
+            None
+        };
+
         Ok((
             PosixMode {
                 termios: original_mode,
                 tty_in: self.tty_in,
                 tty_out: out,
                 raw_mode: self.raw_mode.clone(),
+                #[cfg(feature = "kitty-keyboard-protocol")]
+                kitty_out,
             },
             key_map,
         ))
@@ -1480,7 +1822,7 @@ impl Term for PosixTerminal {
 
     /// Create a RAW reader
     fn create_reader(
-        &self,
+        &mut self,
         buffer: Option<PosixBuffer>,
         config: &Config,
         key_map: PosixKeyMap,
@@ -1491,6 +1833,15 @@ impl Term for PosixTerminal {
         } else {
             None
         };
+        // the kitty keyboard protocol is only active if it was enabled on
+        // the last call to `enable_raw_mode`
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        let kitty = self.kitty == KittyDetection::Confirmed;
+        // leftover bytes from the kitty probe (a trailing progressive-
+        // enhancement response or a keystroke read during the probe); feed
+        // them to the reader so they are parsed as input, not lost
+        #[cfg(feature = "kitty-keyboard-protocol")]
+        let pending = std::mem::take(&mut self.pending_probe);
         Ok(PosixRawReader::new(
             self.tty_in,
             sig,
@@ -1498,6 +1849,10 @@ impl Term for PosixTerminal {
             config,
             key_map,
             self.pipe_reader.clone(),
+            #[cfg(feature = "kitty-keyboard-protocol")]
+            kitty,
+            #[cfg(feature = "kitty-keyboard-protocol")]
+            pending,
             #[cfg(target_os = "macos")]
             self.close_on_drop,
         ))
@@ -1735,6 +2090,280 @@ mod termios_ {
         let key = KeyEvent::new(cc, M::NONE);
         log::debug!(target: "rustyline", "{name}: {key:?}");
         key_map.insert(key, cmd);
+    }
+}
+
+#[cfg(feature = "kitty-keyboard-protocol")]
+mod kitty {
+    //! Parsing of kitty keyboard protocol key events (`CSI u`)
+
+    use crate::keys::{KeyCode as K, KeyEvent, Modifiers as M};
+
+    /// Special key code points (Unicode Private Use Area)
+    const INSERT: u32 = 57348;
+    const DELETE: u32 = 57349;
+    const LEFT: u32 = 57350;
+    const RIGHT: u32 = 57351;
+    const UP: u32 = 57352;
+    const DOWN: u32 = 57353;
+    const PAGE_UP: u32 = 57354;
+    const PAGE_DOWN: u32 = 57355;
+    const HOME: u32 = 57356;
+    const END: u32 = 57357;
+
+    /// Parse a `CSI u` key event.
+    /// `csi` is the sequence without the leading ESC, including the `CSI`
+    /// introducer `[` and the final `u` (e.g. `[13;2u`, `[57350u`).
+    pub(crate) fn decode(csi: &[u8]) -> Option<KeyEvent> {
+        if csi.first() != Some(&b'[') || csi.last() != Some(&b'u') {
+            return None;
+        }
+        let body = &csi[1..csi.len() - 1];
+        let params: Vec<&[u8]> = body.split(|&b| b == b';').collect();
+        if params.len() > 3 {
+            return None;
+        }
+        // field 0 is the key code; it may carry alternate-key sub-fields
+        // (only when the terminal reports them), so take the primary value
+        let kcode = primary_num(params[0])?;
+        // field 1 is the modifiers (only when the terminal reports them), so
+        // take the primary value; it may carry an event-type sub-field
+        let mods = if params.len() > 1 {
+            mods_from(primary_num(params[1])?)
+        } else {
+            M::NONE
+        };
+        // field 2 (optional) is the text as codepoints; we don't report it,
+        // so it is ignored
+        Some(key_event(kcode, mods))
+    }
+
+    /// Parse the first colon-separated sub-field of a field as a number.
+    fn primary_num(field: &[u8]) -> Option<u32> {
+        let primary = field.split(|&b| b == b':').next()?;
+        parse_num(primary)
+    }
+
+    fn parse_num(s: &[u8]) -> Option<u32> {
+        if s.is_empty() {
+            return None;
+        }
+        let mut v = 0u32;
+        for &b in s {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            v = v.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+            if v > 0x10_FFFF {
+                return None;
+            }
+        }
+        Some(v)
+    }
+
+    /// The modifier field is the modifier mask plus one: `1` means no
+    /// modifiers, `1 + shift` (2) means shift, `1 + ctrl` (5) means ctrl, etc.
+    /// bit 0 = shift, bit 1 = alt, bit 2 = ctrl, bits 3.. are ignored
+    fn mods_from(wire: u32) -> M {
+        let m = wire.saturating_sub(1);
+        let mut mods = M::NONE;
+        if m & 1 != 0 {
+            mods |= M::SHIFT;
+        }
+        if m & 2 != 0 {
+            mods |= M::ALT;
+        }
+        if m & 4 != 0 {
+            mods |= M::CTRL;
+        }
+        mods
+    }
+
+    fn key_event(kcode: u32, mods: M) -> KeyEvent {
+        let k = match kcode {
+            9 => K::Tab,
+            13 => K::Enter,
+            27 => K::Esc,
+            127 => K::Backspace,
+            INSERT => K::Insert,
+            DELETE => K::Delete,
+            LEFT => K::Left,
+            RIGHT => K::Right,
+            UP => K::Up,
+            DOWN => K::Down,
+            PAGE_UP => K::PageUp,
+            PAGE_DOWN => K::PageDown,
+            HOME => K::Home,
+            END => K::End,
+            57364..=57393 => K::F((kcode - 57364 + 1) as u8),
+            // control keys, surrogates, and the rest of the Private Use Area
+            // (lock keys, keypad, ...): not representable as a single key event
+            _ if kcode < 32
+                || (0xD800..=0xDFFF).contains(&kcode)
+                || (57344..=63743).contains(&kcode) =>
+            {
+                return KeyEvent(K::UnknownEscSeq, M::NONE);
+            }
+            // any other valid code point
+            32..=0x10_FFFF => K::Char(char::from_u32(kcode).expect("valid code point")),
+            _ => return KeyEvent(K::UnknownEscSeq, M::NONE),
+        };
+        KeyEvent(k, mods)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{K, KeyEvent, M, decode};
+
+        #[test]
+        fn decode_simple() {
+            assert_eq!(decode(b"[13u"), Some(KeyEvent(K::Enter, M::NONE)));
+            assert_eq!(decode(b"[97u"), Some(KeyEvent(K::Char('a'), M::NONE)));
+            assert_eq!(decode(b"[57350u"), Some(KeyEvent(K::Left, M::NONE)));
+            assert_eq!(decode(b"[57364u"), Some(KeyEvent(K::F(1), M::NONE)));
+            assert_eq!(decode(b"[57376u"), Some(KeyEvent(K::F(13), M::NONE)));
+            assert_eq!(decode(b"[57393u"), Some(KeyEvent(K::F(30), M::NONE)));
+        }
+
+        // modifier field: wire value is (1 + mask);
+        // shift=1, alt=2, ctrl=4, super=8, hyper=16, meta=32,
+        // caps_lock=64, num_lock=128
+        #[test]
+        fn decode_mods() {
+            // a modifier field of 1 (or its absence) means no modifiers
+            assert_eq!(decode(b"[13;1u"), Some(KeyEvent(K::Enter, M::NONE)));
+            // shift (1 + 1 = 2)
+            assert_eq!(decode(b"[13;2u"), Some(KeyEvent(K::Enter, M::SHIFT)));
+            // alt (1 + 2 = 3)
+            assert_eq!(decode(b"[13;3u"), Some(KeyEvent(K::Enter, M::ALT)));
+            // ctrl (1 + 4 = 5)
+            assert_eq!(decode(b"[13;5u"), Some(KeyEvent(K::Enter, M::CTRL)));
+            // shift | ctrl (1 + 5 = 6)
+            assert_eq!(
+                decode(b"[13;6u"),
+                Some(KeyEvent(K::Enter, M::SHIFT | M::CTRL))
+            );
+            // ctrl + left (1 + 4 = 5)
+            assert_eq!(decode(b"[57350;5u"), Some(KeyEvent(K::Left, M::CTRL)));
+            // super (1 + 8 = 9) has no corresponding modifier, is ignored
+            assert_eq!(decode(b"[97;9u"), Some(KeyEvent(K::Char('a'), M::NONE)));
+            // caps_lock (1 + 64 = 65) has no corresponding modifier, is ignored
+            assert_eq!(decode(b"[97;65u"), Some(KeyEvent(K::Char('a'), M::NONE)));
+        }
+
+        #[test]
+        fn decode_with_text() {
+            // the third parameter (text as codepoints) is ignored
+            // (spec example: shift+a -> CSI 97;2;65 u)
+            assert_eq!(decode(b"[97;2;65u"), Some(KeyEvent(K::Char('a'), M::SHIFT)));
+            // an event-type sub-field in the modifier field is ignored
+            assert_eq!(decode(b"[13;2:1u"), Some(KeyEvent(K::Enter, M::SHIFT)));
+        }
+
+        #[test]
+        fn decode_unknown() {
+            // lock key
+            assert_eq!(
+                decode(b"[57358u"),
+                Some(KeyEvent(K::UnknownEscSeq, M::NONE))
+            );
+            // F31 and above are not representable
+            assert_eq!(
+                decode(b"[57394u"),
+                Some(KeyEvent(K::UnknownEscSeq, M::NONE))
+            );
+            // out of range
+            assert_eq!(decode(b"[1114112u"), None);
+            // surrogate
+            assert_eq!(
+                decode(b"[55296u"),
+                Some(KeyEvent(K::UnknownEscSeq, M::NONE))
+            );
+            // malformed
+            assert_eq!(decode(b"[13;"), None);
+            assert_eq!(decode(b"[;u"), None);
+            assert_eq!(decode(b"[13;2"), None);
+            assert_eq!(decode(b"[13;2uX"), None);
+            assert_eq!(decode(b"[]13u"), None);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "kitty-keyboard-protocol"))]
+mod test_kitty {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+
+    use super::{AltFd, PosixRawReader, RawReader as _, UnixStream};
+    use crate::config::Config;
+    use crate::keys::{KeyCode as K, KeyEvent, Modifiers as M};
+
+    /// Write `input` bytes to a kitty-mode reader and check that it produces
+    /// exactly the given key events and nothing else (all input consumed).
+    fn read_kitty(input: &[u8], expected: &[KeyEvent]) {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let mut rdr = PosixRawReader::new(
+            AltFd(reader.as_raw_fd()),
+            None,
+            None,
+            &Config::default(),
+            Default::default(),
+            None,
+            true,       // kitty
+            Vec::new(), // pending
+            #[cfg(target_os = "macos")]
+            false,
+        );
+        writer.write_all(input).unwrap();
+        drop(writer);
+        let mut n = 0;
+        while let Ok(key) = rdr.next_key(false) {
+            let exp = expected.get(n).expect("more keys than expected");
+            assert_eq!(key, *exp, "unexpected key {n}");
+            n += 1;
+        }
+        assert_eq!(n, expected.len(), "fewer keys than expected");
+        assert!(rdr.pushback.is_empty());
+    }
+
+    #[test]
+    fn kitty_shift_enter() {
+        // the motivating case: kitty shift+enter is CSI 13;2 u
+        // (modifier field is 1 + mask; shift = 1 + 1 = 2)
+        read_kitty(b"\x1b[13;2u", &[KeyEvent(K::Enter, M::SHIFT)]);
+    }
+
+    #[test]
+    fn kitty_ctrl_char() {
+        // ctrl+a is CSI 97;5 u (1 + 4 = 5)
+        read_kitty(b"\x1b[97;5u", &[KeyEvent(K::Char('a'), M::CTRL)]);
+    }
+
+    #[test]
+    fn kitty_pua_mods() {
+        // ctrl+left arrow is CSI 57350;5 u (1 + 4 = 5)
+        read_kitty(b"\x1b[57350;5u", &[KeyEvent(K::Left, M::CTRL)]);
+    }
+
+    #[test]
+    fn kitty_unknown_key() {
+        // a key we don't represent (caps lock) becomes UnknownEscSeq
+        read_kitty(b"\x1b[57358u", &[KeyEvent(K::UnknownEscSeq, M::NONE)]);
+    }
+
+    #[test]
+    fn kitty_legacy_fallback() {
+        // an unmodified arrow still comes as a legacy CSI (pushback path)
+        read_kitty(b"\x1b[D", &[KeyEvent(K::Left, M::NONE)]);
+    }
+
+    #[test]
+    fn kitty_raw_bytes() {
+        // enter/tab/letters are sent as raw bytes, not CSI u
+        read_kitty(
+            b"a\r",
+            &[KeyEvent(K::Char('a'), M::NONE), KeyEvent(K::Enter, M::NONE)],
+        );
     }
 }
 

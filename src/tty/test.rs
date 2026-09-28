@@ -186,7 +186,7 @@ impl Term for DummyTerminal {
         Ok(((), ()))
     }
 
-    fn create_reader(&self, _: Option<Buffer>, _: &Config, _: KeyMap) -> Result<Self::Reader> {
+    fn create_reader(&mut self, _: Option<Buffer>, _: &Config, _: KeyMap) -> Result<Self::Reader> {
         Ok(self.keys.clone().into_iter())
     }
 
