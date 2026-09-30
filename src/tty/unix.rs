@@ -461,9 +461,10 @@ impl PosixRawReader {
     /// back and fall back to the legacy parser.
     #[cfg(feature = "kitty-keyboard-protocol")]
     fn escape_csi_kitty(&mut self, seq2: char) -> Result<KeyEvent> {
-        // a valid CSI sequence is ascii, so a non-ascii `seq2` is not a CSI
-        // at all: parse it with the legacy parser
-        if !seq2.is_ascii() {
+        // a `CSI u` key event always starts with a digit (the key code);
+        // a non-digit `seq2` is a legacy CSI sequence — parse it directly
+        // without reading further bytes (which would consume the next key)
+        if !seq2.is_ascii_digit() {
             return self.escape_csi_legacy(seq2);
         }
         let mut csi = vec![b'[', seq2 as u8];
