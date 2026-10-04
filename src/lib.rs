@@ -53,7 +53,7 @@ pub use rustyline_derive::{Completer, Helper, Highlighter, Hinter, Validator};
 pub use crate::binding::{ConditionalEventHandler, Event, EventContext, EventHandler};
 use crate::completion::{Candidate, Completer, longest_common_prefix};
 pub use crate::config::{Behavior, ColorMode, CompletionType, Config, EditMode, HistoryDuplicates};
-use crate::edit::State;
+use crate::edit::{RefreshKind, State};
 use crate::error::ReadlineError;
 use crate::highlight::{CmdKind, Highlighter};
 use crate::hint::Hinter;
@@ -66,7 +66,7 @@ pub use crate::layout::GraphemeClusterMode;
 use crate::layout::Unit;
 pub use crate::prompt::Prompt;
 pub use crate::tty::ExternalPrinter;
-use crate::tty::{Buffer, RawMode as _, RawReader as _, Renderer, Term, Terminal};
+use crate::tty::{Buffer, RawMode as _, RawReader as _, Renderer as _, Term, Terminal};
 pub use crate::undo::Changeset;
 use crate::validate::Validator;
 
@@ -289,35 +289,6 @@ fn complete_hint_line<H: Helper, P: Prompt + ?Sized>(s: &mut State<'_, '_, H, P>
     s.refresh_line()
 }
 
-/// Write `buf` to the terminal renderer and return the number of newlines it
-/// contains. Routing every `page_completions` write through this keeps the
-/// drawn-row count derived from the bytes written (so adding a write site
-/// can't desync the end-of-list cursor restore) without a wrapper type.
-fn write_and_count_newlines<W: Renderer>(out: &mut W, buf: &str) -> Result<u16> {
-    out.write_and_flush(buf)?;
-    Ok(buf.bytes().filter(|&b| b == b'\n').count() as u16)
-}
-
-/// Escape sequence that clears the `newlines - 1` rows drawn below the input
-/// line (a completion grid and any `--More--` lines) and returns the cursor
-/// to the input line itself, without clearing it.
-///
-/// `newlines` is the number of `\n` written below the input line: each grid
-/// row and each `--More--` line starts with one, plus one trailing newline.
-/// The cursor ends up `newlines` rows below the input line (nothing wraps,
-/// so one newline is exactly one row), so we move up and clear that many
-/// times, stopping one short to land on the input line.
-fn clear_list_rows(newlines: u16) -> String {
-    let mut clear = String::new();
-    for _ in 0..(newlines - 1) {
-        // Move up to the row above and clear it (line end to start).
-        clear.push_str("\x1b[A\r\x1b[K");
-    }
-    // Move back to the input line itself; do not clear it.
-    clear.push_str("\x1b[A");
-    clear
-}
-
 fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
     rdr: &mut <Terminal as Term>::Reader,
     s: &mut State<'_, '_, H, P>,
@@ -342,16 +313,10 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
 
     let mut pause_row = s.out.get_rows() - 1;
     let num_rows = nbc.div_ceil(num_cols);
-    // Count every newline written: each one moves the cursor down exactly one
-    // row (a grid row and a `--More--` line are both <= cols wide, so nothing
-    // wraps). This lets us clear the list and restore the cursor to the input
-    // line at the end, without assuming anything about the prompt height or
-    // the number of pauses.
-    let mut newlines = 0u16;
     let mut ab = String::new();
     for row in 0..num_rows {
         if row == pause_row {
-            newlines += write_and_count_newlines(s.out, "\n--More--")?;
+            s.out.write_and_flush("\n--More--")?;
             let mut cmd = Cmd::Noop;
             while cmd != Cmd::SelfInsert(1, 'y')
                 && cmd != Cmd::SelfInsert(1, 'Y')
@@ -377,7 +342,7 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
                 _ => break,
             }
         }
-        newlines += write_and_count_newlines(s.out, "\n")?;
+        s.out.write_and_flush("\n")?;
         ab.clear();
         for col in 0..num_cols {
             let i = (col * num_rows) + row;
@@ -398,25 +363,12 @@ fn page_completions<C: Candidate, H: Helper, P: Prompt + ?Sized>(
         }
         s.out.write_and_flush(ab.as_str())?;
     }
-    newlines += write_and_count_newlines(s.out, "\n")?;
-    // Restore the renderer invariant: the physical cursor must be back on the
-    // input line (row `layout.cursor.row`) when the next repaint runs, because
-    // `clear_old_rows` clears rows *upward from the current cursor* without
-    // first moving to a known row. The caller left the cursor at the input
-    // EOL; we then wrote `newlines` newlines, so it now sits `newlines` rows
-    // below, and the rows we drew are the `newlines` rows above it (the last
-    // being empty, from the trailing newline).
-    //
-    // We do NOT call `repaint(All)` here: it re-renders only the prompt+line
-    // and would clear rows based on `layout.end.row` — which counts the
-    // prompt, not the list — so it clobbers the grid (the original bug, which
-    // was worst with a multi-line prompt). The prompt rows above the input
-    // line were never touched, so no repaint is needed; we simply clear the
-    // list rows and move the cursor back to the input line. The next key
-    // press repaints normally.
-    if newlines > 0 {
-        s.out.write_and_flush(&clear_list_rows(newlines))?;
-    }
+    s.out.write_and_flush("\n")?;
+    // Redraw the prompt at the current cursor position. `Min` skips
+    // `clear_old_rows` (which assumes the cursor is at the old input-line
+    // row and clears upward — wrong after the list has scrolled the
+    // terminal). The list stays in scrollback above, like bash.
+    s.repaint(RefreshKind::Min)?;
     Ok(None)
 }
 
@@ -1097,42 +1049,6 @@ impl<H: Helper, I: History> Iterator for Iter<'_, H, I> {
 
 #[cfg(test)]
 mod test;
-
-#[cfg(test)]
-mod clear_list_rows_tests {
-    use super::clear_list_rows;
-
-    #[test]
-    fn one_row_list_restores_cursor_without_clearing_input() {
-        // newlines = 1 grid row + 1 trailing newline = 2.
-        // Clear the 1 content row, then move up to the input line (no clear).
-        assert_eq!(clear_list_rows(2), "\x1b[A\r\x1b[K\x1b[A");
-    }
-
-    #[test]
-    fn two_row_list_clears_both_grid_rows() {
-        // newlines = 2 grid rows + 1 trailing = 3.
-        // Clear 2 content rows, then move up to the input line.
-        assert_eq!(clear_list_rows(3), "\x1b[A\r\x1b[K\x1b[A\r\x1b[K\x1b[A");
-    }
-
-    #[test]
-    fn paged_list_includes_more_rows() {
-        // newlines = 5 grid rows + 1 `--More--` + 1 trailing = 7.
-        // Every one of the 6 content rows (5 grid + 1 --More--) is cleared.
-        let seq = clear_list_rows(7);
-        // 6 "up+clear" operations, then a final bare "up" to the input line.
-        assert_eq!(seq.matches("\x1b[A\r\x1b[K").count(), 6);
-        assert!(seq.ends_with("\x1b[A"), "must end by moving to the input line");
-    }
-
-    #[test]
-    fn single_newline_is_a_noop() {
-        // A defensive edge: only the trailing newline (no grid row). We clear
-        // 0 content rows and just move back up to the input line.
-        assert_eq!(clear_list_rows(1), "\x1b[A");
-    }
-}
 
 #[cfg(doctest)]
 doc_comment::doctest!("../README.md");
